@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -19,232 +21,216 @@ import (
 	"google.golang.org/grpc/status"
 
 	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	typeV3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	healthPb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
-// tmp: in-memory cache
-var embeddingCache sync.Map
+// CacheEntry holds prompt, its embedding, and the cached response
+// semanticCache builds over time; embeddingCache is legacy exact-match
 
-// some globals for the embedding URL + host
-var embeddingServerURL string
-var embeddingModelHost string
+type CacheEntry struct {
+	Prompt     string
+	Embedding  []float64
+	Response   []byte
+	CreateTime time.Time
+}
+
+var (
+	semanticCache       []*CacheEntry
+	embeddingCache      sync.Map
+	embeddingServerURL  string
+	embeddingModelHost  string
+	similarityThreshold = 0.85
+	cacheMutex          sync.Mutex
+)
+
+func cosineSimilarity(a, b []float64) float64 {
+	var dot, na, nb float64
+	for i := range a {
+		dot += a[i] * b[i]
+		na += a[i] * a[i]
+		nb += b[i] * b[i]
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+}
+
+func findMostSimilarPrompt(vec []float64) (*CacheEntry, float64) {
+	cacheMutex.Lock()
+	defer cacheMutex.Unlock()
+	var best *CacheEntry
+	var bestSim float64
+	for _, e := range semanticCache {
+		if s := cosineSimilarity(vec, e.Embedding); s > bestSim {
+			bestSim, best = s, e
+		}
+	}
+	return best, bestSim
+}
 
 type server struct{}
 
 type healthServer struct{}
 
 func (h *healthServer) Check(ctx context.Context, in *healthPb.HealthCheckRequest) (*healthPb.HealthCheckResponse, error) {
-	log.Printf("[HealthCheck] Received health check request: %+v", in)
 	return &healthPb.HealthCheckResponse{Status: healthPb.HealthCheckResponse_SERVING}, nil
 }
 
 func (h *healthServer) Watch(in *healthPb.HealthCheckRequest, srv healthPb.Health_WatchServer) error {
-	log.Printf("[HealthWatch] Received watch request: %+v", in)
 	return status.Error(codes.Unimplemented, "Watch is not implemented")
 }
 
 func (s *server) Process(srv extProcPb.ExternalProcessor_ProcessServer) error {
 	log.Println("[Process] Starting processing loop")
+	var lastPrompt string
+
 	for {
 		req, err := srv.Recv()
 		if err == io.EOF {
-			log.Println("[Process] Received EOF, terminating processing loop")
+			log.Println("[Process] EOF, exiting")
 			return nil
+		} else if err != nil {
+			log.Printf("[Process] Recv error: %v", err)
+			return status.Errorf(codes.Unknown, "recv error: %v", err)
 		}
-		if err != nil {
-			log.Printf("[Process] Error receiving request: %v", err)
-			return status.Errorf(codes.Unknown, "cannot receive stream request: %v", err)
-		}
-		log.Printf("[Process] Received request: %+v", req)
-
+		log.Printf("[Process] Handling %T", req.Request)
 		var resp *extProcPb.ProcessingResponse
 
 		switch r := req.Request.(type) {
 
-		// pass through request headers unaltered
 		case *extProcPb.ProcessingRequest_RequestHeaders:
-			log.Println("[Process] Processing RequestHeaders")
-			resp = &extProcPb.ProcessingResponse{
-				Response: &extProcPb.ProcessingResponse_RequestHeaders{
-					RequestHeaders: &extProcPb.HeadersResponse{},
-				},
-			}
-			log.Println("[Process] RequestHeaders processed, passing through unchanged")
+			resp = &extProcPb.ProcessingResponse{Response: &extProcPb.ProcessingResponse_RequestHeaders{RequestHeaders: &extProcPb.HeadersResponse{}}}
 
-		// process the request body
 		case *extProcPb.ProcessingRequest_RequestBody:
-			log.Println("[Process] Processing RequestBody for embedding lookup")
 			rb := r.RequestBody
+			log.Printf("[Process] RequestBody, end_of_stream=%v", rb.EndOfStream)
 			if !rb.EndOfStream {
-				log.Println("[Process] RequestBody not complete, continuing to buffer")
-				resp = &extProcPb.ProcessingResponse{
-					Response: &extProcPb.ProcessingResponse_RequestBody{
-						RequestBody: &extProcPb.BodyResponse{},
-					},
-				}
-				// send the incomplete body response, continue with the next msg
-				if err := srv.Send(resp); err != nil {
-					log.Printf("[Process] Error sending response: %v", err)
-				}
+				srv.Send(&extProcPb.ProcessingResponse{Response: &extProcPb.ProcessingResponse_RequestBody{RequestBody: &extProcPb.BodyResponse{}}})
 				continue
 			}
 
-			var reqPayload map[string]interface{}
-			if err := json.Unmarshal(rb.Body, &reqPayload); err != nil {
-				log.Printf("[Process] Failed to unmarshal request JSON: %v", err)
-				// pass through unchanged if the JSON cannot be decoded
-				resp = &extProcPb.ProcessingResponse{
-					Response: &extProcPb.ProcessingResponse_RequestBody{
-						RequestBody: &extProcPb.BodyResponse{},
-					},
-				}
+			// parse JSON once complete
+			var pl map[string]interface{}
+			if err := json.Unmarshal(rb.Body, &pl); err != nil {
+				log.Printf("[Process] JSON parse failed: %v", err)
+				resp = &extProcPb.ProcessingResponse{Response: &extProcPb.ProcessingResponse_RequestBody{RequestBody: &extProcPb.BodyResponse{}}}
 				break
 			}
 
-			// if a "prompt" field exists, perform an embedding lookup
-			if promptRaw, ok := reqPayload["prompt"]; ok {
-				prompt, ok := promptRaw.(string)
-				if !ok {
-					log.Println("[Process] 'prompt' field is not a string, skipping embedding lookup")
-				} else {
-					// cache hit check
-					if _, found := embeddingCache.Load(prompt); found {
-						log.Println("[Process] Cache hit for prompt embedding")
-					} else {
-						log.Println("[Process] Cache miss, calling embedding model server")
-						if embeddingServerURL == "" {
-							log.Println("[Process] EMBEDDING_MODEL_SERVER env var not set; skipping embedding lookup")
+			// extract prompt
+			if raw, ok := pl["prompt"]; ok {
+				if prompt, ok2 := raw.(string); ok2 {
+					log.Printf("[Process] Prompt: %s", prompt)
+					lastPrompt = prompt
+
+					// lookup embedding in legacy cache
+					var emb []float64
+					if v, ok3 := embeddingCache.Load(prompt); ok3 {
+						emb = v.([]float64)
+						log.Println("[Process] Legacy cache hit for embedding")
+					} else if embeddingServerURL != "" {
+						// fetch embedding
+						log.Println("[Process] Cache miss, fetching embedding from", embeddingServerURL)
+						reqMap := map[string]interface{}{"instances": []string{prompt}}
+						data, _ := json.Marshal(reqMap)
+						client := &http.Client{Timeout: 10 * time.Second}
+						httpReq, err := http.NewRequest("POST", embeddingServerURL, bytes.NewReader(data))
+						if err != nil {
+							log.Printf("[Process] HTTP request err: %v", err)
 						} else {
-							// call embedding
-							embedReqPayload := map[string]interface{}{
-								"instances": []string{prompt},
+							httpReq.Header.Set("Content-Type", "application/json")
+							if embeddingModelHost != "" {
+								httpReq.Host = embeddingModelHost
+								log.Printf("[Process] Set Host header: %s", embeddingModelHost)
 							}
-							bodyData, err := json.Marshal(embedReqPayload)
+							httpResp, err := client.Do(httpReq)
 							if err != nil {
-								log.Printf("[Process] Error marshaling embedding request payload: %v", err)
+								log.Printf("[Process] Fetch embedding err: %v", err)
 							} else {
-								log.Printf("[Process] Calling embedding model server at URL: %s", embeddingServerURL)
-								log.Printf("[Process] Embedding request payload: %s", string(bodyData))
-								client := &http.Client{Timeout: 10 * time.Second}
-								httpReq, err := http.NewRequest("POST", embeddingServerURL, bytes.NewReader(bodyData))
-								if err != nil {
-									log.Printf("[Process] Error creating HTTP request: %v", err)
-								} else {
-									httpReq.Header.Set("Content-Type", "application/json")
-									if embeddingModelHost != "" {
-										httpReq.Host = embeddingModelHost
-										log.Printf("[Process] Setting Host header to: %s", embeddingModelHost)
-									}
-									for key, values := range httpReq.Header {
-										log.Printf("[Process] Embedding Request Header: %s: %v", key, values)
-									}
-									httpResp, err := client.Do(httpReq)
-									if err != nil {
-										log.Printf("[Process] Error calling embedding model server: %v", err)
-									} else {
-										log.Printf("[Process] Embedding server response status: %s", httpResp.Status)
-										for key, values := range httpResp.Header {
-											log.Printf("[Process] Embedding Response Header: %s: %v", key, values)
-										}
-										respBytes, err := io.ReadAll(httpResp.Body)
-										if err != nil {
-											log.Printf("[Process] Error reading embedding response: %v", err)
-										}
-										httpResp.Body.Close()
-										log.Printf("[Process] Embedding server returned body: %s", string(respBytes))
-										var embedResponse struct {
-											Predictions [][]float64 `json:"predictions"`
-										}
-										if err := json.Unmarshal(respBytes, &embedResponse); err != nil {
-											log.Printf("[Process] Error parsing embedding response: %v", err)
-										} else if len(embedResponse.Predictions) == 0 {
-											log.Println("[Process] Received empty predictions from embedding model")
-										} else {
-											embedding := embedResponse.Predictions[0]
-											log.Printf("[Process] Received embedding: %+v", embedding)
-											embeddingCache.Store(prompt, embedding)
-										}
-									}
+								log.Printf("[Process] Embedding responded: %s", httpResp.Status)
+								b, _ := io.ReadAll(httpResp.Body)
+								httpResp.Body.Close()
+								var o struct{ Predictions [][]float64 }
+								if json.Unmarshal(b, &o) == nil && len(o.Predictions) > 0 {
+									emb = o.Predictions[0]
+									embeddingCache.Store(prompt, emb)
+									log.Printf("[Process] Stored new embedding len=%d", len(emb))
 								}
 							}
 						}
 					}
+
+					// if embedding exists, try semantic hit
+					if len(emb) > 0 {
+						log.Printf("[Process] Semantic lookup on %d entries", len(semanticCache))
+						if e, sim := findMostSimilarPrompt(emb); e != nil && sim >= similarityThreshold && e.Response != nil {
+							log.Println("[Process] Semantic cache HIT, short-circuiting")
+							srv.Send(&extProcPb.ProcessingResponse{Response: &extProcPb.ProcessingResponse_ImmediateResponse{ImmediateResponse: &extProcPb.ImmediateResponse{Status: &typeV3.HttpStatus{Code: 200}, Body: e.Response}}})
+							continue
+						}
+					}
 				}
-			} else {
-				log.Println("[Process] No 'prompt' field found in request; skipping embedding lookup")
 			}
 
-			// always pass through the original request body unaltered
-			resp = &extProcPb.ProcessingResponse{
-				Response: &extProcPb.ProcessingResponse_RequestBody{
-					RequestBody: &extProcPb.BodyResponse{},
-				},
-			}
-			log.Println("[Process] RequestBody processed; original payload passed through unchanged")
+			// pass through request body
+			resp = &extProcPb.ProcessingResponse{Response: &extProcPb.ProcessingResponse_RequestBody{RequestBody: &extProcPb.BodyResponse{}}}
 
 		case *extProcPb.ProcessingRequest_ResponseHeaders:
-			log.Println("[Process] Processing ResponseHeaders, passing through unchanged")
-			resp = &extProcPb.ProcessingResponse{
-				Response: &extProcPb.ProcessingResponse_ResponseHeaders{
-					ResponseHeaders: &extProcPb.HeadersResponse{},
-				},
-			}
-			log.Println("[Process] ResponseHeaders processed, passing through unchanged")
+			resp = &extProcPb.ProcessingResponse{Response: &extProcPb.ProcessingResponse_ResponseHeaders{ResponseHeaders: &extProcPb.HeadersResponse{}}}
 
 		case *extProcPb.ProcessingRequest_ResponseBody:
-			log.Println("[Process] Processing ResponseBody, passing through unchanged")
-			resp = &extProcPb.ProcessingResponse{
-				Response: &extProcPb.ProcessingResponse_ResponseBody{
-					ResponseBody: &extProcPb.BodyResponse{},
-				},
+			rb := r.ResponseBody
+			log.Printf("[Process] ResponseBody, end_of_stream=%v", rb.EndOfStream)
+			if rb.EndOfStream && lastPrompt != "" {
+				// on full LLM response, record semanticCache entry
+				cacheMutex.Lock()
+				if embI, ok := embeddingCache.Load(lastPrompt); ok {
+					emb := embI.([]float64)
+					semanticCache = append(semanticCache, &CacheEntry{Prompt: lastPrompt, Embedding: emb, Response: rb.Body, CreateTime: time.Now()})
+					log.Printf("[Process] Added semanticCache entry for %s", lastPrompt)
+				}
+				cacheMutex.Unlock()
 			}
-			log.Println("[Process] ResponseBody processed, passing through unchanged")
+			resp = &extProcPb.ProcessingResponse{Response: &extProcPb.ProcessingResponse_ResponseBody{ResponseBody: &extProcPb.BodyResponse{}}}
 
 		default:
-			log.Printf("[Process] Received unrecognized request type: %+v", r)
 			resp = &extProcPb.ProcessingResponse{}
 		}
 
-		if err := srv.Send(resp); err != nil {
-			log.Printf("[Process] Error sending response: %v", err)
-		} else {
-			log.Printf("[Process] Sent response: %+v", resp)
-		}
+		// send response
+		srv.Send(resp)
 	}
 }
 
 func main() {
 	embeddingServerURL = os.Getenv("EMBEDDING_MODEL_SERVER")
-	if embeddingServerURL == "" {
-		log.Println("[Main] WARNING: EMBEDDING_MODEL_SERVER env var not set; external embedding lookup will be skipped")
-	} else {
-		log.Printf("[Main] Using embedding model server at: %s", embeddingServerURL)
-	}
 	embeddingModelHost = os.Getenv("EMBEDDING_MODEL_HOST")
-	if embeddingModelHost != "" {
-		log.Printf("[Main] Using embedding model host: %s", embeddingModelHost)
+	log.Printf("[Main] EMBEDDING_MODEL_SERVER=%s", embeddingServerURL)
+	log.Printf("[Main] EMBEDDING_MODEL_HOST=%s", embeddingModelHost)
+	if ts := os.Getenv("SIMILARITY_THRESHOLD"); ts != "" {
+		if v, err := strconv.ParseFloat(ts, 64); err == nil {
+			similarityThreshold = v
+			log.Printf("[Main] similarityThreshold=%.3f", similarityThreshold)
+		}
 	}
 
 	lis, err := net.Listen("tcp", ":50051")
 	if err != nil {
-		log.Fatalf("[Main] Failed to listen: %v", err)
+		log.Fatalf("[Main] Listen error: %v", err)
 	}
 	s := grpc.NewServer()
 	extProcPb.RegisterExternalProcessorServer(s, &server{})
 	healthPb.RegisterHealthServer(s, &healthServer{})
-	log.Println("[Main] Starting gRPC server on port :50051")
-
-	// graceful shutdown
-	gracefulStop := make(chan os.Signal, 1)
-	signal.Notify(gracefulStop, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
-		<-gracefulStop
-		log.Println("[Main] Received shutdown signal, exiting after 1 second")
-		time.Sleep(1 * time.Second)
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
+		<-c
 		os.Exit(0)
 	}()
-
+	log.Println("[Main] ext_proc listening on :50051")
 	if err := s.Serve(lis); err != nil {
-		log.Fatalf("[Main] Failed to serve: %v", err)
+		log.Fatalf("[Main] Serve error: %v", err)
 	}
 }
