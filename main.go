@@ -77,7 +77,6 @@ type healthServer struct{}
 func (h *healthServer) Check(ctx context.Context, in *healthPb.HealthCheckRequest) (*healthPb.HealthCheckResponse, error) {
 	return &healthPb.HealthCheckResponse{Status: healthPb.HealthCheckResponse_SERVING}, nil
 }
-
 func (h *healthServer) Watch(in *healthPb.HealthCheckRequest, srv healthPb.Health_WatchServer) error {
 	return status.Error(codes.Unimplemented, "Watch is not implemented")
 }
@@ -95,8 +94,9 @@ func (s *server) Process(srv extProcPb.ExternalProcessor_ProcessServer) error {
 			log.Printf("[Process] Recv error: %v", err)
 			return status.Errorf(codes.Unknown, "recv error: %v", err)
 		}
-		log.Printf("[Process] Handling %T", req.Request)
+
 		var resp *extProcPb.ProcessingResponse
+		log.Printf("[Process] Handling %T", req.Request)
 
 		switch r := req.Request.(type) {
 
@@ -125,13 +125,12 @@ func (s *server) Process(srv extProcPb.ExternalProcessor_ProcessServer) error {
 					log.Printf("[Process] Prompt: %s", prompt)
 					lastPrompt = prompt
 
-					// lookup embedding in legacy cache
+					// lookup embedding
 					var emb []float64
 					if v, ok3 := embeddingCache.Load(prompt); ok3 {
 						emb = v.([]float64)
 						log.Println("[Process] Legacy cache hit for embedding")
 					} else if embeddingServerURL != "" {
-						// fetch embedding
 						log.Println("[Process] Cache miss, fetching embedding from", embeddingServerURL)
 						reqMap := map[string]interface{}{"instances": []string{prompt}}
 						data, _ := json.Marshal(reqMap)
@@ -162,13 +161,21 @@ func (s *server) Process(srv extProcPb.ExternalProcessor_ProcessServer) error {
 						}
 					}
 
-					// if embedding exists, try semantic hit
+					// similarity logging
 					if len(emb) > 0 {
 						log.Printf("[Process] Semantic lookup on %d entries", len(semanticCache))
-						if e, sim := findMostSimilarPrompt(emb); e != nil && sim >= similarityThreshold && e.Response != nil {
-							log.Println("[Process] Semantic cache HIT, short-circuiting")
-							srv.Send(&extProcPb.ProcessingResponse{Response: &extProcPb.ProcessingResponse_ImmediateResponse{ImmediateResponse: &extProcPb.ImmediateResponse{Status: &typeV3.HttpStatus{Code: 200}, Body: e.Response}}})
-							continue
+						e, sim := findMostSimilarPrompt(emb)
+						if e != nil {
+							log.Printf("[Process] Best candidate: %s with similarity=%.3f (threshold=%.3f)", e.Prompt, sim, similarityThreshold)
+							if sim >= similarityThreshold && e.Response != nil {
+								log.Printf("[Process] similarity %.3f >= threshold %.3f; cache HIT", sim, similarityThreshold)
+								srv.Send(&extProcPb.ProcessingResponse{Response: &extProcPb.ProcessingResponse_ImmediateResponse{ImmediateResponse: &extProcPb.ImmediateResponse{Status: &typeV3.HttpStatus{Code: 200}, Body: e.Response}}})
+								continue
+							} else {
+								log.Printf("[Process] similarity %.3f < threshold %.3f; no cache hit", sim, similarityThreshold)
+							}
+						} else {
+							log.Println("[Process] semanticCache empty; no candidate to compare")
 						}
 					}
 				}
@@ -184,7 +191,6 @@ func (s *server) Process(srv extProcPb.ExternalProcessor_ProcessServer) error {
 			rb := r.ResponseBody
 			log.Printf("[Process] ResponseBody, end_of_stream=%v", rb.EndOfStream)
 			if rb.EndOfStream && lastPrompt != "" {
-				// on full LLM response, record semanticCache entry
 				cacheMutex.Lock()
 				if embI, ok := embeddingCache.Load(lastPrompt); ok {
 					emb := embI.([]float64)
