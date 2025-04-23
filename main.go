@@ -40,7 +40,7 @@ var (
 	embeddingCache      sync.Map
 	embeddingServerURL  string
 	embeddingModelHost  string
-	similarityThreshold = 0.85
+	similarityThreshold = 0.75
 	cacheMutex          sync.Mutex
 )
 
