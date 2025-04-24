@@ -26,7 +26,7 @@ import (
 )
 
 // CacheEntry holds prompt, its embedding, and the cached response
-// semanticCache builds over time; embeddingCache is legacy exact-match
+// semanticCache builds over time; embeddingCache is exact-match
 
 type CacheEntry struct {
 	Prompt     string
@@ -129,7 +129,7 @@ func (s *server) Process(srv extProcPb.ExternalProcessor_ProcessServer) error {
 					var emb []float64
 					if v, ok3 := embeddingCache.Load(prompt); ok3 {
 						emb = v.([]float64)
-						log.Println("[Process] Legacy cache hit for embedding")
+						log.Println("[Process] Exact match cache hit for embedding")
 					} else if embeddingServerURL != "" {
 						log.Println("[Process] Cache miss, fetching embedding from", embeddingServerURL)
 						reqMap := map[string]interface{}{"instances": []string{prompt}}
