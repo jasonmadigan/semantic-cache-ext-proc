@@ -1,12 +1,17 @@
 `ext_proc` for LLM Token Usage data
 
-An Envoy `ext_proc` filter for adding Semantic Caching to LLM inference requests
+An Envoy `ext_proc` filter for adding Semantic Caching to LLM inference requests. Not recommended for any sort of production scenario.
 
-TODO: flow-chart
+- Envoy `ext_proc` for semantic caching of LLM responses
+- In memory caching of (ideally replaced with FAISS or similar vector store/query service)
+- Short-circuit for same prompts
 
-TODO: env-vars
 
-TODO: how to run
+Missing: 
+
+- A proper vector store + querying (e.g. FAISS)
+- Configurability re: model, model versioning etc.
+- Expiration!
 
 ```bash
 # From kuadrant/kserve-poc, run:
@@ -19,11 +24,6 @@ Apply filter:
 
 ```bash
 kubectl apply -f filter.yaml
-```
-
-Install an embedding model:
-
-```bash
 ```
 
 Run ext_proc:
@@ -277,4 +277,40 @@ Calling SmolLM LLM ...
 2025/04/23 10:10:05 [Process] Best candidate: What is Kubernetes with similarity=0.755 (threshold=0.750)
 2025/04/23 10:10:05 [Process] similarity 0.755 >= threshold 0.750; cache HIT
 2025/04/23 10:10:05 [Process] EOF, exiting
+```
+
+
+
+## Diagram
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant E as Envoy
+    participant EP as "ext_proc (Semantic Cache)"
+    participant EM as "Embedding Model"
+    participant Cache as "Cosine-sim Cache Lookup (inside ext_proc)"
+    participant LLM as "LLM Model"
+
+    C->>E: Inference request
+    E->>EP: Hand off to ext_proc
+
+    %% embedding is always produced
+    EP->>EM: Generate embedding
+    EP->>Cache: Lookup by cosine similarity
+
+    alt Cache HIT
+        Cache-->>EP: Cached LLM response
+        EP-->>E: Return cached response
+        E-->>C: Final response
+    else Cache MISS
+        Cache-->>EP: Miss
+        EP->>LLM: Forward prompt
+        LLM-->>EP: LLM response
+        EP->>Cache: Store embedding + response
+        EP-->>E: Return LLM response
+        E-->>C: Final response
+    end
+
+    Note right of EP: ext_proc runs inside Envoy, cache lookup and cached-response handling are internal to ext_proc
 ```
